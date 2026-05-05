@@ -1,0 +1,121 @@
+---
+title: "Assessing covariate-adjusted risk differences in small-sample clinical trials"
+author: "Martin Schnuerch & Christian Stock"
+date: today
+format: 
+  html:
+    theme: lumen
+    toc: true
+    toc-title: Contents
+    toc_depth: 4
+    toc-expand: 2
+    toc-location: left
+    df_print: paged
+    code-fold: false
+    math: mathjax
+    fig-path: "figures/"
+    fig-cap-location: top
+    number-sections: true
+    number-depth: 3
+    fig-width: 10
+    grid:
+      sidebar-width: 300px # 300 px
+      body-width: 1000px # 900 px
+      margin-width: 150px # 300 px
+      gutter-width: 1.5rem
+highlight: kate 
+knitr:
+  opts_chunk: 
+    collapse: true
+    warning: false
+    message: false
+    prompt: true
+    comment: ""
+    fig.path: "figures/"
+    size: "scriptsize"
+    R.options:
+      knitr.graphics.auto_pdf: true 
+engine: knitr
+embed-resources: true     
+standalone: true  
+bibliography: bib-export.bib
+csl: asa.csl  
+editor_options: 
+  markdown: 
+    wrap: 72 
+---
+
+```{r}
+#| label: setup
+#| eval: true
+#| echo: false
+#| warning: false
+```
+
+# Introduction
+
+## Theoretical Background
+
+In randomized controlled trials, adjusting for prognostic baseline covariates has been shown to enhance statistical inference by reducing bias from systematic group differences and improving efficiency through decreased residual variance. Regulatory bodies now explicitly recommend covariate adjustment, emphasizing that the chosen statistical estimator must align with the clinical question and trial objective [@FDA.2023]. This emphasis follows the ICH E9(R1) Addendum on estimands, which underscores the importance of clearly defining the treatment effect of interest and ensuring that the estimator reflects this definition [@ICH.2020].
+
+However, practical implementation, especially in non-linear models like logistic regression, can be challenging. While logistic regression is commonly used for binary outcomes, the typical analysis -- assessing conditional odds ratios -- may not reflect the marginal treatment effect of interest due to sensitivity to model specification and non-collapsibility. As a result, recent literature and regulatory guidance advocate for marginal estimators of collapsible statistics such as risk differences or ratios. A powerful method for estimating marginal treatment effects that is explicitly mentioned in the FDA guidance is *g*-computation (or 'standardization').
+
+While *g*-computation offers a conceptually straightforward approach for estimating marginal treatment effects such as risk differences, valid statistical inference -- particularly variance estimation and hypothesis testing -- is less straightforward. Several variance estimators have been proposed [e.g., @Bannick.2023; @Ge.2011; @Ye.2023; @Liu.2024] each with distinct theoretical properties and practical trade-offs. However, most research has focused on asymptotic behavior and point estimation, leaving uncertainty around hypothesis testing in small-sample contexts [but see @Liu.2024]. This is particularly relevant in early-phase clinical trials, rare disease studies, or childhood diseases, where sample sizes are inherently limited. Moreover, there is a lack of comparative studies evaluating *g*-computation-based inference methods against simpler (model-free) alternatives, which typically rely on fewer assumptions and may offer greater robustness in small-sample settings. Exploring these comparisons is crucial for guiding methodological choices in realistic trial scenarios where parametric inference may be unreliable.
+
+## Research Objectives
+
+To address these gaps, we aim to evaluate the operating characteristics of a wide range of statistical approaches in different population scenarios by means of simulation. Specifically, our goal is to identify how the different proposed methods perform in small-sample settings and under which conditions model-based, assumption-rich methods offer practical advantages over simpler, more robust alternatives. Thereby, we hope to provide practical guidance for selecting appropriate statistical methods that balance statistical efficiency, robustness to model assumptions, and interpretability of results.
+
+The methods considered in this simulation study are
+
+- *g*-computation-based approaches using a Wald test based on different parametric variance estimators as proposed by
+    - @Ge.2011,
+    - @Liu.2024, and
+    - @Ye.2023 (modified and implemented by @Bannick.2023);
+- a *g*-computation-based approach using a Wald test with a variance estimator based on non-parametric bootstrap as proposed by @Steingrimsson.2017;
+- a *g*-computation approach using a Wald test based on Firth robust logistic regression with FLIC correction [@Puhr.2017];
+- a *g*-computation approach using a score test as proposed by @Zhang.2025;
+- the common Mantel-Haenszel risk difference estimator using a Wald test based on variance estimators proposed by 
+    - @Sato.1989, and
+    - @Qiu.2024;
+- the Cochran-Mantel-Haenszel chi-squared test proposed by @Mantel.1959, and 
+- the exact unconditional test proposed by @Suissa.1985.
+    
+## Scope of the Simulation Study
+
+To address the objectives stated above, we will assess the following outcome measures:
+
+- prevalence of computational issues (convergence, separation), 
+- Type I error / power, and 
+- estimation (bias, rmse, coverage of confidence intervals). 
+
+To that end, the following parameters are systematically varied:
+
+- statistical method (as listed above), 
+- total sample size (in a range of 30 through 150 in steps of 30),
+- true average treatment effect RD = (0, 0.15, 0.30),
+- prognostic value of covariates.
+
+
+{{< include risk_differences_simulation.qmd >}}
+
+# References 
+
+## Methodological references 
+
+ 
+
+::: {#refs}
+:::
+
+ 
+
+
+## Session info 
+
+```{r}
+#| label: session_info
+#| eval: true
+#| echo: true
+sessionInfo()
+```

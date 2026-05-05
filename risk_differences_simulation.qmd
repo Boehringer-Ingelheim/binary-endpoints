@@ -1,0 +1,1595 @@
+
+# Simulation Study
+
+## Required Packages and Help Functions
+
+```{r}
+#| label: packages
+#| eval: true
+#| echo: true
+#| code-fold: true
+
+# Load required packages
+suppressPackageStartupMessages({
+  # General
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(parallel)
+  library(furrr)
+  library(tibble)
+  library(Rcpp)
+  library(DT)
+  library(ggplot2)
+  library(clustermq)
+  library(foreach)
+  library(doRNG)
+  library(kableExtra)
+  # Specific Analyses
+  library(RobinCar)
+  library(Exact)
+  library(sandwich)
+  library(margins)
+  library(marginaleffects)
+  library(detectseparation)
+  library(logistf)
+  #library(fastglm)
+})
+
+# Source helper scripts
+
+# source helper scripts from R/
+for (f in list.files("R", pattern = "*.R", full.names = TRUE)) {
+  source(f)
+}
+
+# source helper scripts from src/
+for (f in list.files("src", pattern = "*.cpp", full.names = TRUE)) {
+  sourceCpp(f)
+}
+
+# Set cluster options
+options(clustermq.scheduler = "slurm")
+```
+
+## Simulation Parameters
+
+We specify the following parameters to define the different simulation scenarios:
+
+```{r}
+#| label: simScenarios
+#| eval: true
+#| echo: true
+
+# Total sample sizes
+n <- seq(30, 150, 30)
+
+# Proportion/prevalence/response rate in control group
+prev <- .2
+
+# Difference of treatment group to control
+diff <- c(0, .15, .3)
+
+# Define distribution for each covariate
+cov_rng <- list(
+  c("rbinom", "rbinom")
+)
+
+# Set parameters for distribution functions specified above (skip n)
+cov_pars <- list(
+  list(
+    c(size = 1, prob = .5),
+    c(size = 1, prob = .5)
+  )
+)
+
+# True regression weights of covariates
+cov_coefs <- list(
+  "none" = log(c(1, 1)),
+  "medium" = log(c(1.5, 1.5)),
+  "high" = log(c(3, 3))
+)
+
+# Randomization scheme
+rand <- "simple"
+
+# Treatment allocation
+treat_alloc <- list(
+  c(1,1)
+)
+
+# Create all possible factor combinations
+scenarios <- expand_grid(
+  n,
+  prev,
+  diff,
+  cov_rng,
+  cov_pars,
+  cov_coefs,
+  rand, 
+  treat_alloc
+)
+scenarios <- scenarios |> 
+  mutate(
+    pop_coefs = purrr::pmap(scenarios[,2:6], def_population_coefs)
+  )
+
+rm(n, diff, prev, cov_rng, cov_pars, cov_coefs, rand, treat_alloc)
+```
+
+To evaluate the chosen parameter values, we can check the implied (marginal) probabilities across treatment groups and covariates:
+
+```{r}
+#| label: tabulateProbs
+#| eval: true
+#| echo: true
+#| code-fold: true
+
+# define helper function
+get_prob <- function(x1, x2, z, pop_coefs, cov_coefs) {
+  
+  b0 <- unlist(pop_coefs)[1]
+  bz <- unlist(pop_coefs)[2]
+  b1 <- unlist(cov_coefs)[1]
+  b2 <- unlist(cov_coefs)[2]
+  plogis(b0 + z * bz + x1 * b1 + x2 * b2)
+  
+}
+
+# output matrix
+out <- matrix(nrow = 18, ncol = 7)
+
+for (s in 1:9) {
+  
+  # temporary array of probabilities
+  tmp <- array(dim = c(2, 2, 2))
+  
+  for (i in 1:2) {
+    tmp[,,i] <- outer(
+      X = c(0, 1),
+      Y = c(0, 1),
+      FUN = get_prob,
+      z = c(0, 1)[i],
+      pop_coefs = scenarios[s, "pop_coefs"],
+      cov_coefs = scenarios[s, "cov_coefs"]
+    )
+  }
+  
+  # calculate marginal probabilities and marginal effect
+  marg_x_0 <- mean(tmp[1,,]) |> rep(2)
+  marg_x_1 <- mean(tmp[2,,]) |> rep(2)
+  me_x <- (mean(tmp[2,,]) - mean(tmp[1,,])) |> rep(2)
+  
+  # combine
+  out[((s - 1) * 2 + 1):(s*2),] <- cbind(
+    tmp[,,1], tmp[,,2], 
+    marg_x_0, marg_x_1, me_x
+  ) |> round(digits = 2)
+  
+}
+
+# Prepare output table 
+data.frame(
+  rep(c("0", "0.15", "0.30"), each = 6),
+  rep(c("log(1)", "log(1.5)", "log(3)"), each = 2, times = 3),
+  rep(c("x1 = 0", "x1 = 1"), times = 9),
+  out
+) |> 
+  kable(
+    "html",
+    col.names = c("\\[ \\text{RD}_z \\]", "\\[ \\beta_x \\]", "\\[ x_1\\]", rep(c("\\[ x_2 = 0\\]", "\\[ x_2 = 1\\]"), 2), 
+                  "\\[ \\bar{x = 0} \\]", "\\[ \\bar{x = 1} \\]", "\\[ \\text{RD}_x \\]"),
+    escape = TRUE,
+    digits = 2,
+    align = "c"
+  ) |>
+  kableExtra::collapse_rows(columns = c(1, 2, 8, 9, 10), valign = "middle") |> 
+  kableExtra::add_header_above(c(" " = 3, "z = 0" = 2, "z = 1" = 2, " " = 3)) |>
+  kableExtra::kable_styling()
+
+```
+
+
+
+## Run the Simulation
+
+```{r}
+#| label: runSimulation
+#| eval: true
+#| echo: true
+#| cache: true
+#| cache-lazy: false
+#| message: false
+#| warning: false
+
+# 1) Use an RNG suitable for parallel streams
+RNGkind("L'Ecuyer-CMRG")   # Recommended for reproducible parallel RNG
+
+# 2) Set a single, top-level seed ONCE
+set.seed(20260119)
+
+# 3) Set simulation parameters
+chunk_size <- 1250
+replications <- 5e4
+chunks <- ceiling(replications / chunk_size)
+total_jobs <- nrow(scenarios) * chunks
+
+# 4) Register clustermq backend
+register_dopar_cmq(
+  n_jobs = total_jobs,
+  memory = 4096,
+  export = mget(ls(envir = .GlobalEnv), envir = .GlobalEnv)
+)
+
+# 5) Start simulation
+(start_time <- Sys.time())
+
+res <- foreach(job = 1:total_jobs, .combine = 'rbind',
+               .options.RNG = 2026011) %dorng% {
+  
+  # Compute scenario and chunk index
+  scenario_id <- ((job - 1) %/% chunks) + 1
+  chunk_id <- ((job - 1) %% chunks) + 1
+  
+  # Run the chunk
+  single_scenario(
+    n_sim = chunk_size,
+    params = scenarios[scenario_id, ],
+    methods = c(
+      "compute_suissa_shuster", "compute_cmh", "compute_mh_sato",
+      "compute_mh_mgr", "compute_ge", "compute_ye", "compute_liu",
+      "compute_g_firth", "compute_score_test", "compute_boot"
+    ),
+    alpha = 0.05,
+    type_Ge = "orig",
+    type_Liu = "HC3",
+    flic = TRUE,
+    R = 1000,
+    boot_strat = FALSE
+  )
+  
+}
+
+# End simulation
+(end_time <- Sys.time())
+
+# Total duration
+end_time - start_time
+
+```
+
+Let's save the results:
+
+```{r}
+#| label: saveResults
+#| eval: true
+#| echo: true
+#| cache: true
+#| code-fold: true
+
+saveRDS(
+  object = res,
+  file = "sim_results.rds"
+)
+```
+
+
+```{r}
+#| label: temp
+#| echo: false
+#| eval: false
+
+res <- readRDS("sim_results.rds")
+```
+
+
+## Results
+
+```{r}
+#| label: results
+#| eval: true
+#| echo: true
+#| cache: true
+#| cache-lazy: false
+#| code-fold: true
+
+res <- res |> 
+  mutate(
+    id = rep(seq_len(replications * nrow(scenarios)), each = 10),
+    cov_prog_val = sapply(
+      `list(cov_coefs)`, 
+      \(x) ifelse(
+        identical(x, log(rep(1, 2))), 
+        "none",
+        ifelse(
+          identical(x, log(rep(1.5, 2))), 
+          "medium",
+          "high"
+        )
+      )
+    ),
+    bias = rd_est - diff,
+    coverage = dplyr::between(diff, rd_lcl, rd_ucl),
+    reject = rd_pval < .05
+  ) |> 
+  group_by(id) |> 
+  mutate(
+    converged = na.omit(converged) |> unique(),
+    separation = na.omit(separation) |> unique(),
+    separation_treatment = na.omit(separation_treatment) |> unique()
+  )
+```
+
+
+### Convergence Issues/Separation
+
+Full table of results:
+
+```{r}
+#| label: checkIssues
+#| eval: true
+#| echo: true
+#| code-fold: true
+
+res |> 
+  group_by(n, diff, cov_prog_val) |> 
+  summarize(
+    convergence = mean(!converged),
+    separation = mean(separation),
+    .groups = "drop"
+  ) |> 
+  datatable(options = list(
+    scrollX = TRUE,
+    scrollY = "400px",
+    pageLength = 24
+  ))
+```
+
+Visualization:
+
+```{r}
+#| label: plotConvergence
+#| echo: false
+#| eval: true
+
+# res |> 
+#   group_by(n, diff, cov_prog_val) |> 
+#   summarize(
+#     separation = mean(separation),
+#     .groups = "drop"
+#   ) |> 
+#   filter(n < 100) |> 
+#   mutate(rd = case_when(
+#     diff == 0 ~ "Risk Difference = 0",
+#     diff == 0.15 ~ "Risk Difference = 0.15",
+#     TRUE ~ "Risk Difference = 0.30"
+#   )) |> 
+#   ggplot(aes(x = n, y = separation, linetype = cov_prog_val, color = cov_prog_val)) +
+#   facet_wrap(~ rd) +
+#   geom_line(lwd = .75) +
+#   geom_point(size = 2) +
+#   scale_x_continuous(
+#     limits = c(30, 90),
+#     breaks = c(30, 60, 90)
+#   ) +
+#   scale_linetype_discrete(
+#     "Prog. Val. Covariates"
+#   ) +
+#   scale_color_discrete(
+#     "Prog. Val. Covariates"
+#   ) +
+#   labs(
+#     x = "Total Sample Size",
+#     y = "% Convergence Issues"
+#   ) +
+#   theme_bw() +
+#   theme(
+#     text = element_text(size = 10, color = "black"),
+#     legend.position = "bottom",
+#     legend.key.width = unit(1.5, "lines"),
+#     axis.text = element_text(size = 10, color = "black")
+#   )
+
+rd <- c(
+  "0"    = "delta==0",
+  "0.15" = "delta==0.15",
+  "0.3" = "delta==0.30"
+)
+
+labeller_rd <- as_labeller(rd, label_parsed)
+
+res |>
+  group_by(n, diff, cov_prog_val) |>
+  summarize(
+    separation = mean(separation),
+    .groups = "drop"
+  ) |>
+  mutate(diff = as.character(diff)) |>
+  filter(n < 100) |>
+  mutate(cov_prog_val = factor(
+    cov_prog_val, 
+    levels = c("high", "medium", "none"),
+    labels = c("log(3)", "log(1.5)", "log(1)"))) |> 
+  ggplot(aes(x = n, y = separation,
+             linetype = cov_prog_val,
+             shape = cov_prog_val,
+             color = cov_prog_val)) +
+  facet_wrap(~ diff, labeller = labeller_rd) +
+  geom_line(lwd = .75) +
+  geom_point(size = 3) +
+  scale_x_continuous(
+    limits = c(30, 90),
+    breaks = c(30, 60, 90)
+  ) +
+  scale_linetype_manual(
+    expression(paste(beta[1],",",beta[2])),
+    values = c("solid", "dashed", "dotted")
+  ) +
+  scale_shape_manual(
+    expression(paste(beta[1],",",beta[2])),
+    values = c(15, 17, 16)
+  ) +
+  scale_color_manual(
+    expression(paste(beta[1],",",beta[2])),
+    values = c("firebrick", "red", "darksalmon")
+  ) +
+  labs(
+    x = "Total Sample Size",
+    y = "% Separation Issues"
+  ) +
+  theme_bw() +
+  theme(
+    text = element_text(size = 12, color = "black"),
+    legend.position = "bottom",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 12, color = "black")
+  )
+
+```
+
+### Power, Bias, & Coverage
+
+```{r}
+#| label: checkResults
+#| eval: true
+#| echo: true
+#| code-fold: true
+
+res_agg <- res |> 
+  mutate(sep_cat = ifelse(separation, ifelse(separation_treatment, "treatment", "covariate"), "none")) |> 
+  filter(converged) |> 
+  group_by(n, diff, cov_prog_val, sep_cat, method) |>
+  summarize(
+    bias_mean = mean(bias, na.rm = TRUE),
+    rmse = sqrt(mean(bias^2, na.rm = TRUE)),
+    coverage = mean(coverage, na.rm = TRUE),
+    power = mean(reject, na.rm = TRUE),
+    n_cases = n(),
+    .groups = "drop"
+  )
+
+# res_agg |>
+#   datatable(options = list(
+#     scrollX = TRUE,
+#     scrollY = "400px",
+#     pageLength = 100
+#   )) |>
+#   formatRound(columns = 6:9, digits = 3)
+
+```
+
+
+### Figures: Type I Error/Power
+
+```{r}
+#| label: preparePlotData
+#| echo: false
+#| eval: true
+#| cache: true
+
+plot_dat <- res |> 
+  mutate(cov_prog_val = factor(cov_prog_val, 
+                                    levels = c("none", "medium", "high"),
+                                    labels = c("Prog. Val: None",
+                                               "Prog. Val: Medium",
+                                               "Prog. Val: High"))
+  ) |> 
+  filter(converged) |> 
+  group_by(n, diff, cov_prog_val, method) |>
+  summarize(
+    bias_mean = mean(bias, na.rm = TRUE),
+    rmse = sqrt(mean(bias^2, na.rm = TRUE)),
+    coverage = mean(coverage, na.rm = TRUE),
+    power = mean(reject, na.rm = TRUE),
+    n_cases = n(),
+    .groups = "drop"
+  )
+
+```
+
+```{r}
+#| label: plotOptions
+#| echo: false
+#| eval: true
+
+# Gather methods and organize in clusters
+breaks <- c(
+  "Ge (orig)", "Liu (HC3)", "Ye", "Firth (FLIC)", "g-comp bootstrap", "Score Test",
+  "MH (mGR)", "MH (Sato)", "cmh test", "suissa-shuster"
+)
+
+# Set labels
+labels <- c(
+  "G-Comp.: Ge",
+  "G-Comp.: Liu",
+  "G-Comp.: Ye",
+  "G-Comp.: Firth",
+  "G-Comp.: Bootstrap",
+  "G-Comp.: Score Test",
+  "Mantel-Haenszel RD: modified GR",
+  "Mantel-Haenszel RD: Sato",
+  "Cochran-Mantel-Haenszel Test",
+  "Suissa-Shuster Test"
+)
+
+# Set colors: unique per method, grouped by clusters
+values <- c(
+  "dodgerblue4", "lightskyblue1", "deepskyblue", "dodgerblue", "#5DADE2", "blue",  # G-Comp (blue family)
+  "#E69F00", "#F0E442",                                              # MH (orange/yellow)
+  "#CC79A7",                                                         # Suissa-Shuster (magenta)
+  "#009E73"                                                          # CMH (green)
+)
+
+# Linetypes: Same within cluster, different across clusters
+line_types <- c(
+  rep("solid", 6),      # G-Comp
+  rep("dashed", 2),     # MH
+  "dotdash",            # CMH
+  "dotted"              # Suissa-Shuster
+)
+
+# Shapes: Unique within clusters
+shapes <- c(19, 17, 15, 3, 8, 18, 19, 17, 15, 19)
+```
+
+
+#### Type I Error (True Null Effect)
+
+```{r}
+#| label: plotOverallPowerNull
+#| echo: false
+#| eval: true
+
+plot_dat %>%
+  filter(diff == 0, cov_prog_val == "Prog. Val: None") %>%
+  ggplot(aes(x = n, y = power, group = method)) +
+  geom_hline(yintercept = .05, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Type I Error", limits = c(.025, .105), breaks = seq(0.03, .09, .02)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0; Prog. Val. Covariate: None") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+plot_dat %>%
+  filter(diff == 0, cov_prog_val == "Prog. Val: Medium") %>%
+  ggplot(aes(x = n, y = power, group = method)) +
+  geom_hline(yintercept = .05, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Type I Error", limits = c(.025, .105), breaks = seq(0.03, .09, .02)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0; Prog. Val. Covariate: Medium") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+plot_dat %>%
+  filter(diff == 0, cov_prog_val == "Prog. Val: High") %>%
+  ggplot(aes(x = n, y = power, group = method)) +
+  geom_hline(yintercept = .05, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Type I Error", limits = c(.025, .105), breaks = seq(0.03, .09, .02)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0; Prog. Val. Covariate: High") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+```
+
+
+#### Power (True Small Effect)
+
+```{r}
+#| label: plotOverallPowerSmall
+#| echo: false
+#| eval: true
+
+plot_dat %>%
+  filter(diff == 0.15, cov_prog_val == "Prog. Val: None") %>%
+  ggplot(aes(x = n, y = power, group = method)) +
+  geom_hline(yintercept = .05, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Power", limits = c(.1, .6), breaks = seq(.1, .6, .1)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.15; Prog. Val. Covariate: None") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+plot_dat %>%
+  filter(diff == 0.15, cov_prog_val == "Prog. Val: Medium") %>%
+  ggplot(aes(x = n, y = power, group = method)) +
+  geom_hline(yintercept = .05, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Power", limits = c(.1, .6), breaks = seq(.1, .6, .1)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.15; Prog. Val. Covariate: Medium") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+plot_dat %>%
+  filter(diff == 0.15, cov_prog_val == "Prog. Val: High") %>%
+  ggplot(aes(x = n, y = power, group = method)) +
+  geom_hline(yintercept = .05, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Power", limits = c(.1, .6), breaks = seq(.1, .6, .1)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.15; Prog. Val. Covariate: High") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+```
+
+
+#### Power (True Large Effect)
+
+```{r}
+#| label: plotOverallPowerMedium
+#| echo: false
+#| eval: true
+
+plot_dat %>%
+  filter(diff == 0.30, cov_prog_val == "Prog. Val: None") %>%
+  ggplot(aes(x = n, y = power, group = method)) +
+  geom_hline(yintercept = .05, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Power", limits = c(.35, 1), breaks = seq(0.4, 1, .2)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.30; Prog. Val. Covariate: None") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+plot_dat %>%
+  filter(diff == 0.30, cov_prog_val == "Prog. Val: Medium") %>%
+  ggplot(aes(x = n, y = power, group = method)) +
+  geom_hline(yintercept = .05, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Power", limits = c(.35, 1), breaks = seq(0.4, 1, .2)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.30; Prog. Val. Covariate: Medium") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+plot_dat %>%
+  filter(diff == 0.30, cov_prog_val == "Prog. Val: High") %>%
+  ggplot(aes(x = n, y = power, group = method)) +
+  geom_hline(yintercept = .05, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Power", limits = c(.35, 1), breaks = seq(0.4, 1, .2)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.30; Prog. Val. Covariate: High") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+```
+
+
+### Figures: Bias
+
+```{r}
+#| label: plotOptions2
+#| echo: false
+#| eval: true
+
+# Filter plot_data to exclude methods without CI
+plot_dat <- filter(plot_dat, !(method %in% c("cmh test")))
+
+# Gather methods and organize in clusters
+breaks <- c(
+  "Ge (orig)", "Liu (HC3)", "Ye", "Firth (FLIC)", "g-comp bootstrap", "Score Test",
+  "MH (mGR)", "MH (Sato)", "suissa-shuster"
+)
+
+# Set labels
+labels <- c(
+  "G-Comp.: Ge",
+  "G-Comp.: Liu",
+  "G-Comp.: Ye",
+  "G-Comp.: Firth",
+  "G-Comp.: Bootstrap",
+  "G-Comp.: Score Test",
+  "Mantel-Haenszel RD: modified GR",
+  "Mantel-Haenszel RD: Sato",
+  "Suissa-Shuster Test"
+)
+
+# Set colors: unique per method, grouped by clusters
+values <- c(
+  "dodgerblue4", "lightskyblue1", "deepskyblue", "dodgerblue", "#5DADE2", "blue",  # G-Comp (blue family)
+  "#E69F00", "#F0E442",                                              # MH (orange/yellow)
+  "#009E73"                                                          # CMH (green)
+)
+
+# Linetypes: Same within cluster, different across clusters
+line_types <- c(
+  rep("solid", 6),      # G-Comp
+  rep("dashed", 2),     # MH
+  "dotted"              # Suissa-Shuster
+)
+
+# Shapes: Unique within clusters
+shapes <- c(19, 17, 15, 3, 8, 18, 19, 17, 19)
+```
+
+#### True Null Effect
+
+**Caution**: Please note the narrow range on the y-axis. The tight bounds are intentional to highlight minor differences between methods, should they exist.
+
+```{r}
+#| label: plotBiasNull
+#| echo: false
+#| eval: true
+#| width: 9
+
+r <- plot_dat %>%
+  filter(diff == 0, cov_prog_val == "Prog. Val: None") %>%
+  ggplot(aes(x = n, y = rmse, group = method)) +
+  geom_hline(yintercept = 0, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("RMSE", limits = c(0, .16) , breaks = seq(0, .15, .05)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0; Prog. Val. Covariate: None") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+b <- plot_dat %>%
+  filter(diff == 0, cov_prog_val == "Prog. Val: None") %>%
+  ggplot(aes(x = n, y = bias_mean, group = method)) +
+  geom_hline(yintercept = 0, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Bias", limits = c(-.0015, .0015)
+                     , breaks = seq(-.0015, .0015, .0015)
+                     ) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0; Prog. Val. Covariate: None") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+ggpubr::ggarrange(b, r, nrow = 1, common.legend = TRUE, legend = "bottom", align = "h")
+
+
+r <- plot_dat %>%
+  filter(diff == 0, cov_prog_val == "Prog. Val: Medium") %>%
+  ggplot(aes(x = n, y = rmse, group = method)) +
+  geom_hline(yintercept = 0, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("RMSE", limits = c(0, .16) , breaks = seq(0, .15, .05)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0; Prog. Val. Covariate: Medium") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+b <- plot_dat %>%
+  filter(diff == 0, cov_prog_val == "Prog. Val: Medium") %>%
+  ggplot(aes(x = n, y = bias_mean, group = method)) +
+  geom_hline(yintercept = 0, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Bias", limits = c(-.0015, .0015)
+                     , breaks = seq(-.0015, .0015, .0015)
+  ) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0; Prog. Val. Covariate: Medium") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+ggpubr::ggarrange(b, r, nrow = 1, common.legend = TRUE, legend = "bottom", align = "h")
+
+
+r <- plot_dat %>%
+  filter(diff == 0, cov_prog_val == "Prog. Val: High") %>%
+  ggplot(aes(x = n, y = rmse, group = method)) +
+  geom_hline(yintercept = 0, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("RMSE", limits = c(0, .16) , breaks = seq(0, .15, .05)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0; Prog. Val. Covariate: High") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+b <- plot_dat %>%
+  filter(diff == 0, cov_prog_val == "Prog. Val: High") %>%
+  ggplot(aes(x = n, y = bias_mean, group = method)) +
+  geom_hline(yintercept = 0, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Bias", limits = c(-.0015, .0015)
+                     , breaks = seq(-.0015, .0015, .0015)
+  ) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0; Prog. Val. Covariate: High") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+ggpubr::ggarrange(b, r, nrow = 1, common.legend = TRUE, legend = "bottom", align = "h")
+
+```
+
+
+#### True Medium Effect
+
+**Caution**: Please note the change in the y-axis range.
+
+```{r}
+#| label: plotBiasMedium
+#| echo: false
+#| eval: true
+
+r <- plot_dat %>%
+  filter(diff == 0.15, cov_prog_val == "Prog. Val: None") %>%
+  ggplot(aes(x = n, y = rmse, group = method)) +
+  geom_hline(yintercept = 0, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("RMSE", limits = c(0, .2) , breaks = seq(0, .2, .05)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.15; Prog. Val. Covariate: None") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+b <- plot_dat %>%
+  filter(diff == 0.15, cov_prog_val == "Prog. Val: None") %>%
+  ggplot(aes(x = n, y = bias_mean, group = method)) +
+  geom_hline(yintercept = 0, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Bias", limits = c(-.022, .005) , breaks = seq(-.02, .005, .005)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.15; Prog. Val. Covariate: None") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+ggpubr::ggarrange(b, r, nrow = 1, common.legend = TRUE, legend = "bottom", align = "h")
+
+
+r <- plot_dat %>%
+  filter(diff == 0.15, cov_prog_val == "Prog. Val: Medium") %>%
+  ggplot(aes(x = n, y = rmse, group = method)) +
+  geom_hline(yintercept = 0, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("RMSE", limits = c(0, .2) , breaks = seq(0, .2, .05)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.15; Prog. Val. Covariate: Medium") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+b <- plot_dat %>%
+  filter(diff == 0.15, cov_prog_val == "Prog. Val: Medium") %>%
+  ggplot(aes(x = n, y = bias_mean, group = method)) +
+  geom_hline(yintercept = 0, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Bias", limits = c(-.022, .005) , breaks = seq(-.02, .005, .005)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.15; Prog. Val. Covariate: Medium") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+ggpubr::ggarrange(b, r, nrow = 1, common.legend = TRUE, legend = "bottom")
+
+
+r <- plot_dat %>%
+  filter(diff == 0.15, cov_prog_val == "Prog. Val: High") %>%
+  ggplot(aes(x = n, y = rmse, group = method)) +
+  geom_hline(yintercept = 0, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("RMSE", limits = c(0, .2) , breaks = seq(0, .2, .05)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.15; Prog. Val. Covariate: High") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+b <- plot_dat %>%
+  filter(diff == 0.15, cov_prog_val == "Prog. Val: High") %>%
+  ggplot(aes(x = n, y = bias_mean, group = method)) +
+  geom_hline(yintercept = 0, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Bias", limits = c(-.022, .005) , breaks = seq(-.02, .005, .005)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.15; Prog. Val. Covariate: High") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+ggpubr::ggarrange(b, r, nrow = 1, common.legend = TRUE, legend = "bottom")
+```
+
+#### True Large Effect
+
+**Caution**: Please note the change in the y-axis range.
+
+```{r}
+#| label: plotBiasLarge
+#| echo: false
+#| eval: true
+
+r <- plot_dat %>%
+  filter(diff == 0.30, cov_prog_val == "Prog. Val: None") %>%
+  ggplot(aes(x = n, y = rmse, group = method)) +
+  geom_hline(yintercept = 0, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("RMSE", limits = c(0, .2) , breaks = seq(0, .2, .05)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.30; Prog. Val. Covariate: None") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+b <- plot_dat %>%
+  filter(diff == 0.30, cov_prog_val == "Prog. Val: None") %>%
+  ggplot(aes(x = n, y = bias_mean, group = method)) +
+  geom_hline(yintercept = 0, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Bias", limits = c(-.04, .005) , breaks = seq(-.04, .005, .005)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.30; Prog. Val. Covariate: None") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+ggpubr::ggarrange(b, r, nrow = 1, common.legend = TRUE, legend = "bottom")
+
+
+r <- plot_dat %>%
+  filter(diff == 0.30, cov_prog_val == "Prog. Val: Medium") %>%
+  ggplot(aes(x = n, y = rmse, group = method)) +
+  geom_hline(yintercept = 0, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("RMSE", limits = c(0, .2) , breaks = seq(0, .2, .05)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.30; Prog. Val. Covariate: Medium") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+b <- plot_dat %>%
+  filter(diff == 0.30, cov_prog_val == "Prog. Val: Medium") %>%
+  ggplot(aes(x = n, y = bias_mean, group = method)) +
+  geom_hline(yintercept = 0, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Bias", limits = c(-.04, .005) , breaks = seq(-.04, .005, .005)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.30; Prog. Val. Covariate: Medium") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+ggpubr::ggarrange(b, r, nrow = 1, common.legend = TRUE, legend = "bottom")
+
+
+r <- plot_dat %>%
+  filter(diff == 0.30, cov_prog_val == "Prog. Val: High") %>%
+  ggplot(aes(x = n, y = rmse, group = method)) +
+  geom_hline(yintercept = 0, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("RMSE", limits = c(0, .2) , breaks = seq(0, .2, .05)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.30; Prog. Val. Covariate: High") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+b <- plot_dat %>%
+  filter(diff == 0.30, cov_prog_val == "Prog. Val: High") %>%
+  ggplot(aes(x = n, y = bias_mean, group = method)) +
+  geom_hline(yintercept = 0, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Bias", limits = c(-.04, .005) , breaks = seq(-.04, .005, .005)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.30; Prog. Val. Covariate: High") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+ggpubr::ggarrange(b, r, nrow = 1, common.legend = TRUE, legend = "bottom")
+```
+
+
+### Figures: Coverage
+
+```{r}
+#| label: plotOptions3
+#| echo: false
+#| eval: true
+
+# Filter plot_data to exclude methods without CI
+plot_dat <- filter(plot_dat, !(method %in% c("suissa-shuster", "cmh test")))
+
+# Gather methods and organize in clusters
+breaks <- c(
+  "Ge (orig)", "Liu (HC3)", "Ye", "Firth (FLIC)", "g-comp bootstrap", "Score Test",
+  "MH (mGR)", "MH (Sato)"
+)
+
+# Set labels
+labels <- c(
+  "G-Comp.: Ge",
+  "G-Comp.: Liu",
+  "G-Comp.: Ye",
+  "G-Comp.: Firth",
+  "G-Comp.: Bootstrap",
+  "G-Comp.: Score Test",
+  "Mantel-Haenszel RD: modified GR",
+  "Mantel-Haenszel RD: Sato"
+)
+
+# Set colors: unique per method, grouped by clusters
+values <- c(
+  "dodgerblue4", "lightskyblue1", "deepskyblue", "dodgerblue", "#5DADE2", "blue",  # G-Comp (blue family)
+  "#E69F00", "#F0E442"                                              # MH (orange/yellow)
+)
+
+# Linetypes: Same within cluster, different across clusters
+line_types <- c(
+  rep("solid", 6),      # G-Comp
+  rep("dashed", 2)     # MH
+)
+
+# Shapes: Unique within clusters
+shapes <- c(19, 17, 15, 3, 8, 18, 19, 17)
+```
+
+
+#### True Null Effect
+
+```{r}
+#| label: plotCoverageNull
+#| echo: false
+#| eval: true
+
+plot_dat %>%
+  filter(diff == 0, cov_prog_val == "Prog. Val: None") %>%
+  ggplot(aes(x = n, y = coverage, group = method)) +
+  geom_hline(yintercept = .95, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Coverage", limits = c(.9, .98), breaks = seq(0.9, .98, .02)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0; Prog. Val. Covariate: None") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+plot_dat %>%
+  filter(diff == 0, cov_prog_val == "Prog. Val: Medium") %>%
+  ggplot(aes(x = n, y = coverage, group = method)) +
+  geom_hline(yintercept = .95, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Coverage", limits = c(.9, .98), breaks = seq(0.9, .98, .02)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0; Prog. Val. Covariate: Medium") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+plot_dat %>%
+  filter(diff == 0, cov_prog_val == "Prog. Val: High") %>%
+  ggplot(aes(x = n, y = coverage, group = method)) +
+  geom_hline(yintercept = .95, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Coverage", limits = c(.9, .98), breaks = seq(0.9, .98, .02)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0; Prog. Val. Covariate: High") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+```
+
+#### True Medium Effect
+
+```{r}
+#| label: plotCoverageMedium
+#| echo: false
+#| eval: true
+
+plot_dat %>%
+  filter(diff == 0.15, cov_prog_val == "Prog. Val: None") %>%
+  ggplot(aes(x = n, y = coverage, group = method)) +
+  geom_hline(yintercept = .95, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Coverage", limits = c(.9, .98), breaks = seq(0.9, .98, .02)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.15; Prog. Val. Covariate: None") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+plot_dat %>%
+  filter(diff == 0.15, cov_prog_val == "Prog. Val: Medium") %>%
+  ggplot(aes(x = n, y = coverage, group = method)) +
+  geom_hline(yintercept = .95, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Coverage", limits = c(.9, .98), breaks = seq(0.9, .98, .02)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.15; Prog. Val. Covariate: Medium") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+plot_dat %>%
+  filter(diff == 0.15, cov_prog_val == "Prog. Val: High") %>%
+  ggplot(aes(x = n, y = coverage, group = method)) +
+  geom_hline(yintercept = .95, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Coverage", limits = c(.9, .98), breaks = seq(0.9, .98, .02)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.15; Prog. Val. Covariate: High") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+```
+
+#### True Large Effect
+
+```{r}
+#| label: plotCoverageLarge
+#| echo: false
+#| eval: true
+
+plot_dat %>%
+  filter(diff == 0.30, cov_prog_val == "Prog. Val: None") %>%
+  ggplot(aes(x = n, y = coverage, group = method)) +
+  geom_hline(yintercept = .95, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Coverage", limits = c(.9, .98), breaks = seq(0.9, .98, .02)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.30; Prog. Val. Covariate: None") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+plot_dat %>%
+  filter(diff == 0.30, cov_prog_val == "Prog. Val: Medium") %>%
+  ggplot(aes(x = n, y = coverage, group = method)) +
+  geom_hline(yintercept = .95, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Coverage", limits = c(.9, .98), breaks = seq(0.9, .98, .02)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.30; Prog. Val. Covariate: Medium") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+plot_dat %>%
+  filter(diff == 0.30, cov_prog_val == "Prog. Val: High") %>%
+  ggplot(aes(x = n, y = coverage, group = method)) +
+  geom_hline(yintercept = .95, lwd = .75, linetype = "dashed") +
+  geom_line(aes(color = method, linetype = method), linewidth = .8,
+            position = position_dodge(width = 3)) +
+  geom_point(aes(color = method, shape = method), size = 3,
+             position = position_dodge(width = 3)) +
+  scale_y_continuous("Coverage", limits = c(.9, .98), breaks = seq(0.9, .98, .02)) +
+  scale_x_continuous(limits = c(20, 160), breaks = seq(30, 150, 30)) +
+  scale_color_manual("Method", breaks = breaks, values = values, labels = labels) +
+  scale_linetype_manual("Method", breaks = breaks, values = line_types, labels = labels) +
+  scale_shape_manual("Method", breaks = breaks, values = shapes, labels = labels) +
+  labs(x = "Total Sample Size",
+       title = "Risk Difference = 0.30; Prog. Val. Covariate: High") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.key.width = unit(1.5, "lines"),
+    axis.text = element_text(size = 10, color = "black")
+  )
+
+```
