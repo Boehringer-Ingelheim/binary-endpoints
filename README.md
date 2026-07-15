@@ -6,9 +6,8 @@ The repository provides a fully reproducible workflow, including data generation
 
 All analyses are simulation-based and do not require any external or proprietary datasets.
 
----
 
-# Repository Structure
+## Repository Structure
 
 ```text
 binary-endpoints/
@@ -31,13 +30,11 @@ binary-endpoints/
         bisection-search algorithm used within the simulation framework
 ```
 
----
 
-# Master File
 
-## `reproducible_simulation.qmd`
+## Master File
 
-This document contains the complete simulation workflow used to generate the results reported in the manuscript.
+The quarto document `reproducible_simulation.qmd` contains the complete simulation and analysis workflow used to generate the results reported in the manuscript.
 
 Specifically, it:
 
@@ -49,9 +46,8 @@ Specifically, it:
 6. generates all manuscript figures,
 7. documents the computational environment used for the analyses.
 
----
 
-# Reproducing the Results
+## Reproducing the Results
 
 From the repository root directory, render
 
@@ -66,49 +62,31 @@ This will:
 - save figure files to the `figures/` directory,
 - render the supplementary computational document.
 
-Depending on the available computing resources, execution may require substantial computation time.
+**Please note:** Depending on the available computing resources, execution may require substantial computation time.
 
----
 
-# Manuscript Figures
+## Manuscript Figures
 
-All figures reported in the manuscript are generated automatically during execution of
+All figures reported in the manuscript are generated in `reproducible_simulation.qmd` and are saved to the `figures/` subfolder in PDF format.
 
-```text
-reproducible_simulation.qmd
-```
 
-and are saved to
 
-```text
-figures/
-```
-
-in PDF format.
-
-No manual post-processing is required.
-
----
-
-# Data Availability
-
-The analyses are entirely simulation-based.
-
-No patient-level data, proprietary datasets, or external data sources are required to reproduce the results.
+## Data Availability
 
 All data used in the analyses are generated directly from code contained in this repository.
+No patient-level data, proprietary datasets, or external data sources are required to reproduce the results.
 
----
 
-# Random Number Generation
+
+## Random Number Generation
 
 Simulation results rely on pseudorandom number generation.
 
 Random-number generator seeds are explicitly specified within the simulation workflow to facilitate reproducibility.
 
----
 
-# Software Requirements
+
+## Software Requirements
 
 The simulation study was developed and executed using
 
@@ -127,9 +105,8 @@ and therefore must be present in the repository root directory.
 
 ## Computational Requirements
 
-The simulation workflow was developed for execution on a high-performance computing (HPC) cluster using the `clustermq` package.
-
-The default configuration assumes access to a large number of compute cores (more than 1000 concurrent jobs were available for the original analyses).
+The simulation workflow was developed for execution on a high-performance computing (HPC) cluster. 
+The default configuration assumes access to a large number of compute cores (1800 concurrent jobs were available for the original analyses).
 
 Users reproducing the analyses in a different environment will need to modify the cluster configuration and adjust the number of parallel jobs accordingly. Depending on available computational resources, this may substantially increase execution time.
 
@@ -140,8 +117,9 @@ In particular, users without access to an HPC environment should review the sett
 - number of parallel workers,
 - memory allocation.
 
-The simulation code can be executed with fewer cores, but runtime may increase considerably.
+The simulation code can be executed with fewer cores, but runtime will increase considerably.
 
+---
 
 # Session Information
 
