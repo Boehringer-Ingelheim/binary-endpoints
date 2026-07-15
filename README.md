@@ -62,19 +62,26 @@ This will:
 - save figure files to the `figures/` directory,
 - render the supplementary computational document.
 
-**Please note:** Depending on the available computing resources, execution may require substantial computation time.
+**Please note:** Depending on the available computing resources, execution may require substantial computation time. 
+To facilitate reproducibility, the simulated data are archived on Zenodo and publicly available from https://doi.org/10.5281/zenodo.21371937. 
+To run the script without repeating the simulation, you need to change the options of the `runSimulation` code chunk. 
+Specifically, set `eval: false` and add a new code chunk to read in the archived raw data and save them in an object named `res`:
 
-
-## Manuscript Figures
-
-All figures reported in the manuscript are generated in `reproducible_simulation.qmd` and are saved to the `figures/` subfolder in PDF format.
-
-
+```R
+res <- readRDS(<filename>)
+``` 
 
 ## Data Availability
 
 All data used in the analyses are generated directly from code contained in this repository.
 No patient-level data, proprietary datasets, or external data sources are required to reproduce the results.
+
+To facilitate reproducibility, the simulated data are archived on Zenodo and publicly available from https://doi.org/10.5281/zenodo.21371937. 
+
+
+## Manuscript Figures
+
+All figures reported in the manuscript are generated in `reproducible_simulation.qmd` and are saved to the `figures/` subfolder in PDF format.
 
 
 
